@@ -10,6 +10,11 @@ unchanged and write a fresh content.py next to it.
 import streamlit as st
 import os
 import json
+import time
+import fcntl
+import tempfile
+import shutil
+from contextlib import contextmanager
 import uuid
 import anthropic
 
@@ -83,26 +88,92 @@ def new_group_state():
     }
 
 
-def load_groups(class_name):
-    path = groups_path(class_name)
+@contextmanager
+def _state_lock(lock_path):
+    """Exclusive lock so two students clicking at once can't write at the same time."""
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _read_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def _write_json_atomic(path, data):
+    """Write to a temp file, then swap it in, so nobody ever reads a half-written
+    file. The previous version is kept as <file>.bak for recovery."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
     if os.path.exists(path):
-        with open(path) as f:
-            data = json.load(f)
-    else:
-        data = {}
+        shutil.copyfile(path, path + ".bak")
+    os.replace(tmp, path)
+
+
+def _read_or_recover(path, default):
+    """Read the state file. If it is unreadable, set it aside, restore the last
+    good backup (or the default) and write that back, instead of crashing."""
+    if not os.path.exists(path):
+        return default()
+    try:
+        return _read_json(path)
+    except (json.JSONDecodeError, ValueError, OSError):
+        os.replace(path, f"{path}.corrupt-{int(time.time())}")
+        try:
+            data = _read_json(path + ".bak")
+        except Exception:
+            data = default()
+        _write_json_atomic(path, data)
+        return data
+
+
+def groups_lock(class_name):
+    return _state_lock(f"{state_dir(class_name)}/groups.lock")
+
+
+def _write_atomic(class_name, groups):
+    _write_json_atomic(groups_path(class_name), groups)
+
+
+def load_groups(class_name):
+    with groups_lock(class_name):
+        return _load_groups_unlocked(class_name)
+
+
+def update_group(class_name, group_name, fn):
+    """Re-read the latest state, apply fn(gstate) to one group, save, all under
+    the lock. Used after slow AI calls so teammates' changes aren't overwritten."""
+    with groups_lock(class_name):
+        data = _load_groups_unlocked(class_name)
+        fn(data[group_name])
+        _write_atomic(class_name, data)
+    return data
+
+
+def _load_groups_unlocked(class_name):
+    # The app's own setup code, unchanged apart from safe read/write.
+    path = groups_path(class_name)
+    data = _read_or_recover(path, dict)
     changed = False
     for piece in MONOPOLY_PIECES:
         if piece not in data:
             data[piece] = new_group_state()
             changed = True
     if changed:
-        save_groups(class_name, data)
+        _write_atomic(class_name, data)
     return data
 
 
 def save_groups(class_name, groups):
-    with open(f"{state_dir(class_name)}/groups.json", "w") as f:
-        json.dump(groups, f)
+    with groups_lock(class_name):
+        _write_atomic(class_name, groups)
 
 
 def display_name(role, gstate):
@@ -623,10 +694,17 @@ with tab_emails:
                     client, em["brief"], history, reply.strip(),
                     tier2_unlocked=source_unlocked, tier2_source_name=source_name,
                 )
-                thread.append({"role": "user", "content": reply.strip()})
-                thread.append({"role": "assistant", "content": ai_text})
-                gstate["emails"][owner_role][cid] = thread
-                save_groups(CLASS_NAME, groups)
+                new_msgs = [
+                    {"role": "user", "content": reply.strip()},
+                    {"role": "assistant", "content": ai_text},
+                ]
+
+                def _append_reply(g, _owner=owner_role, _cid=cid, _new=new_msgs):
+                    g["emails"][_owner].setdefault(_cid, []).extend(_new)
+
+                # Re-read fresh state before saving: the AI call took seconds, and
+                # teammates may have saved notes/forwards/messages meanwhile.
+                update_group(CLASS_NAME, GROUP_NAME, _append_reply)
                 st.rerun()
         st.divider()
 
