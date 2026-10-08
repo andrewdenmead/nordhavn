@@ -23,7 +23,7 @@ import anthropic
 # per story. Edit these here; leave content.py purely about the scenario.
 # =========================================================================
 
-TEACHER_PASSWORD = "business"
+TEACHER_PASSWORD = os.environ.get("TEACHER_PASSWORD", "").strip() or "business"  # set TEACHER_PASSWORD in Railway
 CLASS_NAME = "default"
 ALLOW_ROLE_DOUBLING = False   # set True only when a teacher's class size won't divide evenly by 3
 ROLE_CAPACITY = 2 if ALLOW_ROLE_DOUBLING else 1
@@ -258,12 +258,23 @@ client = anthropic.Anthropic(api_key=st.session_state.api_key)
 if "class_authenticated" not in st.session_state:
     st.session_state.class_authenticated = False
 
-if not st.session_state.class_authenticated:
+if not st.session_state.class_authenticated:  # login patch 2026-10-08
     st.title(SCENARIO_TITLE)
     st.caption(ORG_NAME)
-    pw = st.text_input("Class password", type="password")
-    if st.button("Enter"):
-        if pw == os.environ.get("CLASS_PASSWORD", ""):
+    # One password box for everyone, in a real form, so the browser can save it. The class password lets
+    # students in; the teacher password lets the teacher in with the dashboard already unlocked.
+    with st.form("enter_form"):
+        pw = st.text_input("Password", type="password", autocomplete="current-password",
+                           help="Students: the class password. Teachers: your teacher password.")
+        entered = st.form_submit_button("Enter")
+    if entered:
+        class_pw = os.environ.get("CLASS_PASSWORD", "")
+        if pw == TEACHER_PASSWORD and pw != class_pw:
+            st.session_state.class_authenticated = True
+            st.session_state.teacher_authenticated = True
+            st.session_state.teacher_mode = True
+            st.rerun()
+        elif pw == class_pw:
             st.session_state.class_authenticated = True
             st.rerun()
         else:
@@ -308,9 +319,11 @@ def teacher_dashboard():
         st.session_state.teacher_authenticated = False
         st.rerun()
 
-    if not st.session_state.teacher_authenticated:
-        pw = st.text_input("Teacher password", type="password", key="teacher_pw")
-        if st.button("Unlock"):
+    if not st.session_state.teacher_authenticated:  # login patch 2026-10-08
+        with st.form("teacher_login_form"):
+            pw = st.text_input("Teacher password", type="password", key="teacher_pw", autocomplete="current-password")
+            unlock = st.form_submit_button("Unlock")
+        if unlock:
             if pw == TEACHER_PASSWORD:
                 st.session_state.teacher_authenticated = True
                 st.rerun()
